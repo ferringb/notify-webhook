@@ -46,10 +46,10 @@ ZEROS = "0000000000000000000000000000000000000000"
 
 def git(args):
     args = ["git"] + args
-    cmd = subprocess.Popen(args, stdout=subprocess.PIPE)
-    details = cmd.stdout.read()
-    details = details.decode("utf-8", "replace").strip()
-    return details
+    result = subprocess.run(
+        args, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, check=True
+    )
+    return result.stdout.decode("utf-8", "replace").strip()
 
 
 def _git_config():
