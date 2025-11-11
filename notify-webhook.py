@@ -161,54 +161,80 @@ def get_revisions(
         # Not sure if it's possible in the real world, but account for it.
         return
 
-    revs = git(["rev-list", "--pretty=medium", "--reverse", f"{old}..{new}"])
-    sections = revs.split("\n\n")
+    def _split_trailers(data: str):
+        results = []
+        for trailer in data.split("\n"):
+            # disregard valueless trailers
+            if len(pairs := trailer.split("\t", 1)) == 2:
+                results.append({pairs[0].strip(): pairs[1].strip()})
+        return tuple(results)
 
-    s = 0
-    while s < len(sections):
-        lines = sections[s].split("\n")
+    def empty_to_none(val):
+        return val if val else None
 
-        # first line is 'commit HASH\n'
-        sha = lines[0].strip().split(" ")[1]
-
-        props = {
-            "sha": sha,
-            "added": [],
-            "removed": [],
-            "modified": [],
-            "url": commit_url % sha if commit_url else None,
+    # see https://git-scm.com/docs/pretty-formats#_pretty_formats
+    tformat_fields = OrderedDict(
+        {
+            # the strip works around some git pretty weirdness with trailers
+            "sha": ("%H", str.strip),
+            "_author.name": ("%an", empty_to_none),
+            "_author.email": ("%ae", empty_to_none),
+            "_committer.name": ("%cn", empty_to_none),
+            "_committer.email": ("%ce", empty_to_none),
+            "date": ("%ad", str),  # github uses ISO-8601
+            "parents": ("%P", str.split),
+            "message": ("%B", str.strip),
+            "trailers": (
+                # newline seperator, value seperator of tabs
+                "%(trailers:separator=%x0a,only=true,unfold=true,key_value_separator=%x09)",
+                _split_trailers,
+            ),
         }
+    )
+
+    tformat = "%x00".join(x[0] for x in tformat_fields.values())
+    tformat += "%x00"
+
+    revs = git(
+        [
+            "rev-list",
+            "--date=iso-strict",
+            "--no-commit-header",
+            f"--pretty=tformat:{tformat}",
+            "--reverse",
+            f"{old}..{new}",
+        ]
+    ).split("\0")
+
+    # drop the trailing terminator
+    i = iter(revs[:-1])
+
+    for record_data in zip(*[i] * len(tformat_fields)):
+        props = {}
+        for pretty_field, value in zip(tformat_fields.items(), record_data):
+            props[pretty_field[0]] = pretty_field[1][1](value)
+        props["url"] = commit_url % props["sha"] if commit_url else None
+
+        # fixup author and commiter
+        for x in ("author", "committer"):
+            props[x] = AuthorData(
+                name=props.pop(empty_to_none(f"_{x}.name")),  # pyright: ignore[reportArgumentType]
+                email=props.pop(empty_to_none(f"_{x}.email")),  # pyright: ignore[reportArgumentType]
+            )
+        assert not any(key.startswith("_") for key in props), (
+            f"code issue; unprocessed keys came through: {list(props)}"
+        )
+
         props.update(
             get_tree_changes_from_commit(
                 props["sha"],
                 # diff-tree doesn't report properly for the first commit in history;
                 # force the parent if it's the first.
-                forced_parent=(
-                    EMPTY_TREE_HASH if s == 0 and old == EMPTY_TREE_HASH else None
-                ),
+                forced_parent=EMPTY_TREE_HASH if not props["parents"] else None,
             )
         )
 
-        # read the header
-        for l in lines[1:]:
-            key, val = l.split(" ", 1)
-            props[key[:-1].lower()] = val.strip()
-
-        # read the commit message
-        # Strip leading tabs/4-spaces on the message
-        props["message"] = re.sub(
-            r"^(\t| {4})", "", sections[s + 1], count=0, flags=re.MULTILINE
-        )
-
-        # use github time format
-        basetime = datetime.strptime(props["date"][:-6], "%a %b %d %H:%M:%S %Y")
-        tzstr = props["date"][-5:]
-        props["date"] = basetime.strftime("%Y-%m-%dT%H:%M:%S") + tzstr
-
-        (name, email) = extract_name_email(props["author"], "unknown")
-        props["author"] = AuthorData(name=name, email=email)
         yield CommitData(**props)
-        s += 2
 
 
 def get_tree_changes_from_commit(
@@ -232,13 +258,13 @@ def get_tree_changes_from_commit(
         ]
     )
     # see git-diff-tree 'RAW OUTPUT FORMAT' for the actions involved
-    # https://git-scm.com/docs/git-diff-tree#_raw_output_forma
+    # https://git-scm.com/docs/git-diff-tree#_raw_output_format
 
     # the last record still has a null which would trigger another record
     # parsing loop
     chunks = iter(raw_tree.split("\0")[:-1])
 
-    changes = defaultdict(list)
+    changes = dict(added=[], removed=[], modified=[])
     for action in chunks:
         # actions can carry a confidence integer percent, thus strip it.
         action = action[0]
@@ -322,46 +348,18 @@ class AuthorData(ToDict):
 
 
 @dataclasses.dataclass(kw_only=True)
-class _BaseCommitData(ToDict):
-    # This is the basic definition.  Dataclass compiles and __init__ on the fly,
-    # we split the classes to allow that to be reused.
+class CommitData(ToDict):
     sha: str
     message: str
     author: AuthorData
+    committer: AuthorData
+    date: str
     added: list[str]
     removed: list[str]
     modified: list[str]
-
-    # outside spec from above.
-    date: str
-    url: None | str
-
-
-class CommitData(_BaseCommitData):
-    # This gets directly injected into the resultant dict.  It's secondary to allow
-    # everything above to have runtime type validation.
-    extras: dict[str, typing.Any]
-
-    def __init__(self, **kwargs) -> None:
-        # dataclasses don't allow extra params; we want the type validation, thus
-        # we isolate what we allow dataclass to handle
-        extras = kwargs.pop("extras", {})
-        extras.update(
-            {
-                k: kwargs.pop(k)
-                for k in list(kwargs)
-                if k not in self.__dataclass_fields__
-            }
-        )
-        super().__init__(**kwargs)
-        self.extras = extras
-
-    def as_dict(self):
-        d = super().as_dict()
-        # we've been returning this historically, so do so.
-        d["id"] = self.sha
-        d.update(self.extras)
-        return d
+    parents: list[str]
+    trailers: list[dict[str, str]]
+    url: str | None
 
 
 @dataclasses.dataclass(kw_only=True)
