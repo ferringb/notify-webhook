@@ -15,8 +15,6 @@ import urllib.request
 from collections import OrderedDict
 from datetime import datetime
 
-EMAIL_RE = re.compile(r"^(\"?)(?P<name>.*)\1\s+<(?P<email>.*)>$")
-
 # see git-diff-tree 'RAW OUTPUT FORMAT'
 # https://git-scm.com/docs/git-diff-tree#_raw_output_format
 DIFF_TREE_RE = re.compile(
@@ -96,14 +94,32 @@ def get_repo_description():
     return ""
 
 
-def extract_name_email(s):
-    p = EMAIL_RE
-    _ = p.search(s.strip())
-    if not _:
-        return (None, None)
-    name = (_.group("name") or "").strip()
-    email = (_.group("email") or "").strip()
-    return (name, email)
+_STRIP_QUOTED_NAME_RE = re.compile(r"^\s*([\"'])\s*(?P<value>.*?)\s*\1\s*$")
+
+
+def _strip_quoted_name(val):
+    # I can't think of why it would come through with \' beyond presumably git CLI escaping, but
+    # whatever, cover that base too.
+    if m := _STRIP_QUOTED_NAME_RE.match(val):
+        return m.groupdict()["value"]
+    return val
+
+
+_EMAIL_RE = re.compile(r"\s*(?P<name>[^<]+?)\s*<\s*(?P<email>[^>]+?)\s*>\s*$")
+
+
+def extract_name_email(s, default_missing=""):
+    s = s.strip()
+
+    if m := _EMAIL_RE.match(s):
+        g = m.groupdict()
+        # compatability: strip out quotation, since the original code tried to do this.
+
+        return (_strip_quoted_name(g["name"]), g["email"])
+    # guess a bit
+    if "@" in s:
+        return default_missing, s
+    return (_strip_quoted_name(s) if s else default_missing, default_missing)
 
 
 def get_repo_owner():
@@ -237,12 +253,8 @@ def get_revisions(
         tzstr = props["date"][-5:]
         props["date"] = basetime.strftime("%Y-%m-%dT%H:%M:%S") + tzstr
 
-        m = EMAIL_RE.match(props["author"])
-        if m:
-            props["author"] = AuthorData(name=m.group(1), email=m.group(2))
-        else:
-            props["author"] = AuthorData(name="unknown", email="unkown")
-
+        (name, email) = extract_name_email(props["author"], "unknown")
+        props["author"] = AuthorData(name=name, email=email)
         yield CommitData(**props)
         s += 2
 
