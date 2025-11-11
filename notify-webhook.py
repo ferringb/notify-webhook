@@ -134,8 +134,11 @@ def get_repo_owner():
     return (repo_owner_name, repo_owner_email)
 
 
-POST_URL = get_config("hooks.webhookurl")
-POST_URLS = get_config("hooks.webhookurls")
+POST_URLS = get_config("hooks.webhookurl", "").strip().split()
+# comma delimited format.  Tolerate dangling commas.
+POST_URLS.extend(
+    x.strip() for x in get_config("hooks.webhookurls", "").split(",") if x.strip()
+)
 POST_USER = get_config("hooks.authuser")
 POST_PASS = get_config("hooks.authpass")
 POST_REALM = get_config("hooks.authrealm")
@@ -404,13 +407,9 @@ def main(lines):
         data = make_json(old, new, ref)
         if DEBUG:
             print(data)
-        urls = []
-        if POST_URL:
-            urls.append(POST_URL)
-        if POST_URLS:
-            urls.extend(re.split(r",\s*", POST_URLS))
-        for url in urls:
-            post(url.strip(), data)
+
+        for url in POST_URLS:
+            post(url, data)
 
 
 if __name__ == "__main__":
