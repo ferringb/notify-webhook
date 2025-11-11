@@ -28,21 +28,22 @@ def git(args):
     return result.stdout.decode("utf-8", "replace").strip()
 
 
-def _git_config():
-    raw_config = git(["config", "-l", "-z"])
-    items = raw_config.split("\0")
-    # remove empty items
-    items = filter(lambda i: len(i) > 0, items)
-    # split into key/value based on FIRST \n; allow embedded \n in values
-    items = [item.partition("\n")[0:3:2] for item in items]
-    return OrderedDict(items)
+def _git_config() -> OrderedDict[str, str]:
+
+    # drop the trailing record termination.  -z returns {key}\n{value} and just {key} if no value.
+    # Ignore things without set values, including empty values.
+    items = (x.split("\n", 1) for x in git(["config", "-l", "-z"]).split("\0")[:-1])
+    return OrderedDict(x for x in items if len(x) != 1 and x[1])
 
 
 GIT_CONFIG = _git_config()
 
 
-def get_config(key, default=None):
-    return GIT_CONFIG.get(key, default)
+T = typing.TypeVar("T")
+
+
+def get_config(key, default: T = None) -> T | str:
+    return GIT_CONFIG.get(key, default)  # pyright: ignore[reportReturnType]
 
 
 def get_repo_name():
@@ -57,17 +58,15 @@ def get_repo_name():
 
 
 def get_repo_description():
-    description = get_config("meta.description")
-    if description:
+    if description := get_config("meta.description"):
         return description
 
-    description = get_config("gitweb.description")
-    if description:
+    if description := get_config("gitweb.description"):
         return description
 
     if os.path.exists("description"):
         with open("description", "r") as fp:
-            return fp.read()
+            return fp.read().strip()
 
     return ""
 
@@ -305,25 +304,6 @@ def get_base_ref(commit, ref):
     return base_ref
 
 
-# http://stackoverflow.com/a/20559031
-
-
-def purify(obj):
-    if hasattr(obj, "items"):
-        newobj = type(obj)()
-        for k in obj:
-            if k is not None and obj[k] is not None:
-                newobj[k] = purify(obj[k])
-    elif hasattr(obj, "__iter__"):
-        newobj = []
-        for k in obj:
-            if k is not None:
-                newobj.append(purify(k))
-    else:
-        return obj
-    return type(obj)(newobj)
-
-
 class ToDict:
     def as_dict(self):
         d = dataclasses.asdict(self)  # pyright: ignore[reportArgumentType]
@@ -448,13 +428,13 @@ def make_json(old, new, ref, **json_serialize_kwargs):
 
 
 def post_encode_data(contenttype, rawdata):
-    if contenttype == "application/json":
-        return rawdata.encode("UTF-8")
-    if contenttype == "application/x-www-form-urlencoded":
-        return urllib.parse.urlencode({"payload": rawdata}).encode("UTF-8")
-
-    assert False, "Unsupported data encoding"
-    return None
+    match contenttype:
+        case "application/json":
+            return rawdata.encode("UTF-8")
+        case "application/x-www-form-urlencoded":
+            return urllib.parse.urlencode({"payload": rawdata}).encode("UTF-8")
+        case _:
+            raise Exception(f"Unsupported data encoding: {contenttype!r}")
 
 
 def build_handler(realm, url, user, passwd):
@@ -488,15 +468,11 @@ def post(url, data):
     opener = urllib.request.build_opener(handler)
 
     try:
-        if POST_TIMEOUT is not None:
-            u = opener.open(request, None, float(POST_TIMEOUT))
-        else:
-            u = opener.open(request)
+        u = opener.open(request, timeout=float(POST_TIMEOUT) if POST_TIMEOUT else None)
         u.read()
         u.close()
     except urllib.error.HTTPError as error:
-        errmsg = "POST to %s returned error code %s." % (url, str(error.code))
-        print(errmsg, file=sys.stderr)
+        logging.warning("POST to %s returned error code %s." % (url, str(error.code)))
 
 
 def main(cli_args=sys.argv[1:], stdin=sys.stdin):
@@ -510,7 +486,7 @@ def main(cli_args=sys.argv[1:], stdin=sys.stdin):
             raise Exception("cli args must be in groups of 3; old new ref")
 
         # make it simpler for cli invocation to behave like hook mode, without
-        # making the humanhave to do things exactly the same.
+        # making the human have to do things exactly the same.
         def f(val):
             if not val.strip("0"):
                 return ZEROS
