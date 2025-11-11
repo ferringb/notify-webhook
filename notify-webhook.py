@@ -140,6 +140,8 @@ POST_CONTENTTYPE = get_config(
     "hooks.webhook-contenttype", "application/x-www-form-urlencoded"
 )
 POST_TIMEOUT = get_config("hooks.timeout")
+# 2048 is github's current limit, so use that as a default.  0 disables the limit.
+POST_MAX_COMMITS = int(get_config("hooks.post-max-commits", "2048"))
 DEBUG = get_config("hooks.webhook-debug", "false") == "true"
 REPO_URL = get_config("meta.url")
 COMMIT_URL = get_config("meta.commiturl")
@@ -154,7 +156,7 @@ REPO_DESC = get_repo_description()
 
 
 def get_revisions(
-    old, new, commit_url: None | str = None
+    old, new, commit_url: None | str = None, max_commits: int = 0
 ) -> typing.Iterable["CommitData"]:
     if old == new:
         # oh get bent.  Someone tried pushing a freshly init'd repo.
@@ -195,19 +197,18 @@ def get_revisions(
     tformat = "%x00".join(x[0] for x in tformat_fields.values())
     tformat += "%x00"
 
-    revs = git(
-        [
-            "rev-list",
-            "--date=iso-strict",
-            "--no-commit-header",
-            f"--pretty=tformat:{tformat}",
-            "--reverse",
-            f"{old}..{new}",
-        ]
-    ).split("\0")
-
+    cmd = [
+        "rev-list",
+        "--date=iso-strict",
+        "--no-commit-header",
+        f"--pretty=tformat:{tformat}",
+        "--reverse",
+        f"{old}..{new}",
+    ]
+    if max_commits:
+        cmd.append(f"--max-count={max_commits}")
     # drop the trailing terminator
-    i = iter(revs[:-1])
+    i = iter(git(cmd).split("\0")[:-1])
 
     for record_data in zip(*[i] * len(tformat_fields)):
         props = {}
@@ -384,7 +385,7 @@ class PushEvent(ToDict):
         return d
 
 
-def make_json(old, new, ref, **json_serialize_kwargs):
+def make_json(old, new, ref, max_commits=POST_MAX_COMMITS, **json_serialize_kwargs):
     # Lots more fields could be added
     # https://developer.github.com/v3/activity/events/types/#pushevent
 
@@ -412,7 +413,9 @@ def make_json(old, new, ref, **json_serialize_kwargs):
     }
 
     if not deleted:
-        data["commits"] = list(get_revisions(old_sha, new, COMMIT_URL))
+        data["commits"] = list(
+            get_revisions(old_sha, new, COMMIT_URL, max_commits=max_commits)
+        )
 
         if base_ref := get_base_ref(new, ref):
             data["base_ref"] = base_ref
