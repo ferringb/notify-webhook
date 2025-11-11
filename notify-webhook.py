@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -7,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import typing
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -160,35 +162,34 @@ REPO_DESC = get_repo_description()
 (REPO_OWNER_NAME, REPO_OWNER_EMAIL) = get_repo_owner()
 
 
-def get_revisions(old, new, head_commit=False):
-    # pylint: disable=R0914,R0912
-    if old == ZEROS:
-        # ref creation
-        commit_range = "%s..%s" % (EMPTY_TREE_HASH, new)
-    elif new == ZEROS:
-        # ref deletion
-        commit_range = "%s..%s" % (old, EMPTY_TREE_HASH)
-    else:
-        commit_range = "%s..%s" % (old, new)
+def get_revisions(
+    old, new, commit_url: None | str = None
+) -> typing.Iterable["CommitData"]:
+    if old == new:
+        # oh get bent.  Someone tried pushing a freshly init'd repo.
+        # Not sure if it's possible in the real world, but account for it.
+        return
 
-    revs = git(["rev-list", "--pretty=medium", "--reverse", commit_range])
+    revs = git(["rev-list", "--pretty=medium", "--reverse", f"{old}..{new}"])
     sections = revs.split("\n\n")
 
-    revisions = []
     s = 0
     while s < len(sections):
         lines = sections[s].split("\n")
 
         # first line is 'commit HASH\n'
+        sha = lines[0].strip().split(" ")[1]
+
         props = {
-            "id": lines[0].strip().split(" ")[1],
+            "sha": sha,
             "added": [],
             "removed": [],
             "modified": [],
+            "url": commit_url % sha if commit_url else None,
         }
 
         # call git diff-tree and get the file changes
-        output = git(["diff-tree", "-r", "-C", "%s" % props["id"]])
+        output = git(["diff-tree", "-r", "-C", "%s" % props["sha"]])
 
         # sort the changes into the added/modified/removed lists
         for i in DIFF_TREE_RE.finditer(output):
@@ -227,30 +228,23 @@ def get_revisions(old, new, head_commit=False):
 
         # read the commit message
         # Strip leading tabs/4-spaces on the message
-        props["message"] = re.sub(r"^(\t| {4})", "", sections[s + 1], 0, re.MULTILINE)
+        props["message"] = re.sub(
+            r"^(\t| {4})", "", sections[s + 1], count=0, flags=re.MULTILINE
+        )
 
         # use github time format
         basetime = datetime.strptime(props["date"][:-6], "%a %b %d %H:%M:%S %Y")
         tzstr = props["date"][-5:]
         props["date"] = basetime.strftime("%Y-%m-%dT%H:%M:%S") + tzstr
 
-        # split up author
         m = EMAIL_RE.match(props["author"])
         if m:
-            props["name"] = m.group(1)
-            props["email"] = m.group(2)
+            props["author"] = AuthorData(name=m.group(1), email=m.group(2))
         else:
-            props["name"] = "unknown"
-            props["email"] = "unknown"
-        del props["author"]
+            props["author"] = AuthorData(name="unknown", email="unkown")
 
-        if head_commit:
-            return props
-
-        revisions.append(props)
+        yield CommitData(**props)
         s += 2
-
-    return revisions
 
 
 def get_base_ref(commit, ref):
@@ -300,53 +294,127 @@ def purify(obj):
     return type(obj)(newobj)
 
 
+class ToDict:
+    def as_dict(self):
+        d = dataclasses.asdict(self)  # pyright: ignore[reportArgumentType]
+        d.update((k, v.as_dict()) for k, v in d.items() if isinstance(v, ToDict))
+        return d
+
+
+# use dataclasses to force the necessary shape of events.
+# See https://web.archive.org/web/20201113233708/https://developer.github.com/webhooks/event-payloads/#push ;
+# the original code was written against v3, github moved on and is marking a fair amount more as required.
+# Continue what this code was originally written against, but also add things missing from that event spec.
+
+
+@dataclasses.dataclass(kw_only=True)
+class AuthorData(ToDict):
+    name: str
+    email: str
+
+
+@dataclasses.dataclass(kw_only=True)
+class _BaseCommitData(ToDict):
+    # This is the basic definition.  Dataclass compiles and __init__ on the fly,
+    # we split the classes to allow that to be reused.
+    sha: str
+    message: str
+    author: AuthorData
+    added: list[str]
+    removed: list[str]
+    modified: list[str]
+
+    # outside spec from above.
+    date: str
+    url: None | str
+
+
+class CommitData(_BaseCommitData):
+    # This gets directly injected into the resultant dict.  It's secondary to allow
+    # everything above to have runtime type validation.
+    extras: dict[str, typing.Any]
+
+    def __init__(self, **kwargs) -> None:
+        # dataclasses don't allow extra params; we want the type validation, thus
+        # we isolate what we allow dataclass to handle
+        extras = kwargs.pop("extras", {})
+        extras.update(
+            {
+                k: kwargs.pop(k)
+                for k in list(kwargs)
+                if k not in self.__dataclass_fields__
+            }
+        )
+        super().__init__(**kwargs)
+        self.extras = extras
+
+    def as_dict(self):
+        d = super().as_dict()
+        # we've been returning this historically, so do so.
+        d["id"] = self.sha
+        d.update(self.extras)
+        return d
+
+
+@dataclasses.dataclass(kw_only=True)
+class PushEvent(ToDict):
+    ref: str
+    before: str
+    after: str
+    repository: dict[str, str | dict]
+    commits: list[CommitData]
+    base_ref: None | str = None
+    compare: None | str = None
+    deleted: bool = False
+    created: bool = False
+
+    def as_dict(self):
+        d = super().as_dict()
+        d["head_commit"] = (
+            None if self.deleted or not self.commits else d["commits"][-1]
+        )
+        # This is outside the spec above, but we've been returning it, so continue to do so.
+        d["size"] = len(self.commits)
+        return d
+
+
 def make_json(old, new, ref, **json_serialize_kwargs):
     # Lots more fields could be added
     # https://developer.github.com/v3/activity/events/types/#pushevent
-    compareurl = None
-    if COMPARE_URL:
-        compareurl = COMPARE_URL % (old, new)
 
+    deleted = new == ZEROS
+    # This is the real sha of old, used for compare urls and for internal git calls.
+    old_sha = EMPTY_TREE_HASH if old == ZEROS else old
     data = {
         "before": old,
         "after": new,
         "ref": ref,
-        "compare": compareurl,
+        "deleted": deleted,
+        "created": not deleted and old == ZEROS,
+        # impossible to compare for a delete, so don't give the compare.
+        "compare": (
+            COMPARE_URL % (old_sha, new) if (COMPARE_URL and not deleted) else None
+        ),
         "repository": {
             "url": REPO_URL,
             "name": REPO_NAME,
             "description": REPO_DESC,
             "owner": {"name": REPO_OWNER_NAME, "email": REPO_OWNER_EMAIL},
         },
+        "commits": [],
+        "base_ref": None,
     }
 
-    revisions = get_revisions(old, new)
-    commits = []
-    for r in revisions:
-        url = None
-        if COMMIT_URL is not None:
-            url = COMMIT_URL % r["id"]
-        commits.append(
-            {
-                "id": r["id"],
-                "author": {"name": r["name"], "email": r["email"]},
-                "url": url,
-                "message": r["message"],
-                "timestamp": r["date"],
-                "added": r["added"],
-                "removed": r["removed"],
-                "modified": r["modified"],
-            }
-        )
-    data["commits"] = commits
-    data["size"] = len(commits)
-    data["head_commit"] = get_revisions(old, new, True)
+    if not deleted:
+        data["commits"] = list(get_revisions(old_sha, new, COMMIT_URL))
 
-    base_ref = get_base_ref(new, ref)
-    if base_ref:
-        data["base_ref"] = base_ref
+        if base_ref := get_base_ref(new, ref):
+            data["base_ref"] = base_ref
 
-    return json.dumps(data, **json_serialize_kwargs)
+    # validate it fully.
+    event = PushEvent(**data)
+
+    return json.dumps(event.as_dict(), **json_serialize_kwargs)
 
 
 def post_encode_data(contenttype, rawdata):
