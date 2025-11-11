@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import subprocess
@@ -12,31 +13,8 @@ import typing
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
-
-# see git-diff-tree 'RAW OUTPUT FORMAT'
-# https://git-scm.com/docs/git-diff-tree#_raw_output_format
-DIFF_TREE_RE = re.compile(
-    r" \
-        ^: \
-          (?P<src_mode>[0-9]{6}) \
-          \s+ \
-          (?P<dst_mode>[0-9]{6}) \
-          \s+ \
-          (?P<src_hash>[0-9a-f]{7,40}) \
-          \s+ \
-          (?P<dst_hash>[0-9a-f]{7,40}) \
-          \s+ \
-          (?P<status>[ADTUX]|[CR][0-9]{1,3}|M[0-9]{0,3}) \
-          \s+ \
-          (?P<file1>\S+) \
-          (?:\s+ \
-            (?P<file2>\S+) \
-          )? \
-        $",
-    re.MULTILINE | re.VERBOSE,
-)
 
 EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 ZEROS = "0000000000000000000000000000000000000000"
@@ -203,39 +181,16 @@ def get_revisions(
             "modified": [],
             "url": commit_url % sha if commit_url else None,
         }
-
-        # call git diff-tree and get the file changes
-        output = git(["diff-tree", "-r", "-C", "%s" % props["sha"]])
-
-        # sort the changes into the added/modified/removed lists
-        for i in DIFF_TREE_RE.finditer(output):
-            item = i.groupdict()
-            if item["status"] == "A":
-                # addition of a file
-                props["added"].append(item["file1"])
-            elif item["status"][0] == "C":
-                # copy of a file into a new one
-                props["added"].append(item["file2"])
-            elif item["status"] == "D":
-                # deletion of a file
-                props["removed"].append(item["file1"])
-            elif item["status"] == "M":
-                # modification of the contents or mode of a file
-                props["modified"].append(item["file1"])
-            elif item["status"][0] == "R":
-                # renaming of a file
-                props["removed"].append(item["file1"])
-                props["added"].append(item["file2"])
-            elif item["status"] == "T":
-                # change in the type of the file
-                props["modified"].append(item["file1"])
-            else:
-                # Covers U (file is unmerged)
-                # and X ("unknown" change type, usually an error)
-                # When we get X, we do not know what actually happened so
-                # it's safest just to ignore it. We shouldn't be seeing U
-                # anyway, so we can ignore that too.
-                pass
+        props.update(
+            get_tree_changes_from_commit(
+                props["sha"],
+                # diff-tree doesn't report properly for the first commit in history;
+                # force the parent if it's the first.
+                forced_parent=(
+                    EMPTY_TREE_HASH if s == 0 and old == EMPTY_TREE_HASH else None
+                ),
+            )
+        )
 
         # read the header
         for l in lines[1:]:
@@ -257,6 +212,69 @@ def get_revisions(
         props["author"] = AuthorData(name=name, email=email)
         yield CommitData(**props)
         s += 2
+
+
+def get_tree_changes_from_commit(
+    sha: str, forced_parent: str | None = None
+) -> typing.Mapping[str, list[str]]:
+    raw_tree = git(
+        [
+            "diff-tree",
+            "--raw",
+            "-z",
+            "-r",
+            # detect copies and renames
+            "-C",
+            "-M",
+            "--no-commit-id",
+            # force the simple format used below.
+            "--name-status",
+            sha if not forced_parent else f"{forced_parent}..{sha}",
+            # ensure git knows that was a revish, flushing out any code bugs.
+            "--",
+        ]
+    )
+    # see git-diff-tree 'RAW OUTPUT FORMAT' for the actions involved
+    # https://git-scm.com/docs/git-diff-tree#_raw_output_forma
+
+    # the last record still has a null which would trigger another record
+    # parsing loop
+    chunks = iter(raw_tree.split("\0")[:-1])
+
+    changes = defaultdict(list)
+    for action in chunks:
+        # actions can carry a confidence integer percent, thus strip it.
+        action = action[0]
+        match action:
+            case "A":
+                changes["added"].append(next(chunks))
+            case "C":
+                # copy.  Just record the addition
+                next(chunks)  # discard source file
+                changes["added"].append(next(chunks))
+            case "D":
+                changes["removed"].append(next(chunks))
+            case "M":
+                changes["modified"].append(next(chunks))
+            case "R":
+                changes["removed"].append(next(chunks))
+                changes["added"].append(next(chunks))
+            case "T":
+                # change of type of file.  Symlink replacing a file, file replacing a symlink, etc.
+                changes["added"].append(next(chunks))
+            case "U":
+                logging.warning(
+                    "encountured U status in diff-tree; this impossible, there is a bug in this script"
+                )
+            case "X":
+                logging.warning(
+                    "encontured status X in diff-tree; please report this, it probably a bug in git itself"
+                )
+            case _:
+                logging.warning(
+                    f"unsupported action encountered during diff-tree: {action!r}"
+                )
+    return changes
 
 
 def get_base_ref(commit, ref):
