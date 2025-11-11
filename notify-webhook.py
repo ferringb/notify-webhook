@@ -300,7 +300,7 @@ def purify(obj):
     return type(obj)(newobj)
 
 
-def make_json(old, new, ref):
+def make_json(old, new, ref, **json_serialize_kwargs):
     # Lots more fields could be added
     # https://developer.github.com/v3/activity/events/types/#pushevent
     compareurl = None
@@ -346,7 +346,7 @@ def make_json(old, new, ref):
     if base_ref:
         data["base_ref"] = base_ref
 
-    return json.dumps(data)
+    return json.dumps(data, **json_serialize_kwargs)
 
 
 def post_encode_data(contenttype, rawdata):
@@ -401,16 +401,37 @@ def post(url, data):
         print(errmsg, file=sys.stderr)
 
 
-def main(lines):
-    for line in lines:
-        old, new, ref = line.strip().split(" ")
-        data = make_json(old, new, ref)
-        if DEBUG:
-            print(data)
+def main(cli_args=sys.argv[1:], stdin=sys.stdin):
+    # disable posting for local invocations.
+    post_urls = POST_URLS
+    debug = DEBUG
+    if cli_args:
+        debug = True
+        post_urls = []
+        if len(cli_args) % 3:
+            raise Exception("cli args must be in groups of 3; old new ref")
 
-        for url in POST_URLS:
-            post(url, data)
+        # make it simpler for cli invocation to behave like hook mode, without
+        # making the humanhave to do things exactly the same.
+        def f(val):
+            if not val.strip("0"):
+                return ZEROS
+            # force full sha like hook does
+            return git(["rev-parse", val])
+
+        i = iter(cli_args)
+        targets = zip(map(f, i), map(f, i), i)
+    else:
+        targets = (line.strip().split(" ", 2) for line in stdin)  # pyright: ignore[reportAssignmentType]
+
+    for old, new, ref in targets:
+        json_data = make_json(old, new, ref, indent=2 if debug else None)
+        if debug:
+            print(json_data)
+
+        for url in post_urls:
+            post(url, json_data)
 
 
 if __name__ == "__main__":
-    main(sys.stdin)
+    main()
