@@ -374,6 +374,7 @@ class PushEvent(ToDict):
     compare: None | str = None
     deleted: bool = False
     created: bool = False
+    forced: bool = False
 
     def as_dict(self):
         d = super().as_dict()
@@ -397,6 +398,7 @@ def make_json(old, new, ref, max_commits=POST_MAX_COMMITS, **json_serialize_kwar
         "after": new,
         "ref": ref,
         "deleted": deleted,
+        "forced": False,
         "created": not deleted and old == ZEROS,
         # impossible to compare for a delete, so don't give the compare.
         "compare": (
@@ -419,6 +421,11 @@ def make_json(old, new, ref, max_commits=POST_MAX_COMMITS, **json_serialize_kwar
 
         if base_ref := get_base_ref(new, ref):
             data["base_ref"] = base_ref
+        if old_sha != EMPTY_TREE_HASH:
+            try:
+                git(["merge-base", "--is-ancestor", old_sha, new])
+            except subprocess.CalledProcessError:
+                data["forced"] = True
 
     # validate it fully.
     event = PushEvent(**data)
