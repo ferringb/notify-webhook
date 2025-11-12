@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
+from multiprocessing.pool import ThreadPool
 
 EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 ZEROS = "0000000000000000000000000000000000000000"
@@ -139,6 +140,7 @@ POST_SECRET_TOKEN = get_config("hooks.secrettoken")
 POST_CONTENTTYPE = get_config(
     "hooks.webhook-contenttype", "application/x-www-form-urlencoded"
 )
+POST_PARALLELISM = int(get_config("hooks.post-parallelism", "2"))
 POST_TIMEOUT = get_config("hooks.timeout")
 # 2048 is github's current limit, so use that as a default.  0 disables the limit.
 POST_MAX_COMMITS = int(get_config("hooks.post-max-commits", "2048"))
@@ -507,14 +509,20 @@ def main(cli_args=sys.argv[1:], stdin=sys.stdin):
     else:
         targets = (line.strip().split(" ", 2) for line in stdin)  # pyright: ignore[reportAssignmentType]
 
-    for old, new, ref in targets:
-        json_data = make_json(old, new, ref, indent=2 if pretty_print else None)
-        if pretty_print:
-            print(json_data)
+    failures = []
+    with ThreadPool(max(1, min(POST_PARALLELISM, len(post_urls)))) as pool:
+        for old, new, ref in targets:
+            json_data = make_json(old, new, ref, indent=2 if pretty_print else None)
+            if pretty_print:
+                print(json_data)
 
-        for url in post_urls:
-            post(url, json_data)
+            for url in post_urls:
+                pool.apply_async(post, (url, json_data), error_callback=failures.append)
+
+    return not failures
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(0 if main() else 1)
