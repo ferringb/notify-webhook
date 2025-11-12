@@ -45,31 +45,6 @@ def get_config(key, default: T = None) -> T | str:
     return GIT_CONFIG.get(key, default)  # pyright: ignore[reportReturnType]
 
 
-def get_repo_name():
-    if get_config("core.bare", "false") == "true":
-        name = os.path.basename(os.getcwd())
-        if name.endswith(".git"):
-            name = name[:-4]
-        return name
-
-    # Fallback:
-    return os.path.basename(os.getcwd())
-
-
-def get_repo_description():
-    if description := get_config("meta.description"):
-        return description
-
-    if description := get_config("gitweb.description"):
-        return description
-
-    if os.path.exists("description"):
-        with open("description", "r") as fp:
-            return fp.read().strip()
-
-    return ""
-
-
 _STRIP_QUOTED_NAME_RE = re.compile(r"^\s*([\"'])\s*(?P<value>.*?)\s*\1\s*$")
 
 
@@ -128,33 +103,89 @@ def get_repo_owner():
     return (repo_owner_name, repo_owner_email)
 
 
-POST_URLS = get_config("hooks.webhookurl", "").strip().split()
-# comma delimited format.  Tolerate dangling commas.
-POST_URLS.extend(
-    x.strip() for x in get_config("hooks.webhookurls", "").split(",") if x.strip()
-)
-POST_USER = get_config("hooks.authuser")
-POST_PASS = get_config("hooks.authpass")
-POST_REALM = get_config("hooks.authrealm")
-POST_SECRET_TOKEN = get_config("hooks.secrettoken")
-POST_CONTENTTYPE = get_config(
-    "hooks.webhook-contenttype", "application/x-www-form-urlencoded"
-)
-POST_PARALLELISM = int(get_config("hooks.post-parallelism", "2"))
-POST_TIMEOUT = get_config("hooks.timeout")
-# 2048 is github's current limit, so use that as a default.  0 disables the limit.
-POST_MAX_COMMITS = int(get_config("hooks.post-max-commits", "2048"))
-DEBUG = get_config("hooks.webhook-debug", "false") == "true"
-REPO_URL = get_config("meta.url")
-COMMIT_URL = get_config("meta.commiturl")
-COMPARE_URL = get_config("meta.compareurl")
-if COMMIT_URL is None and REPO_URL is not None:
-    COMMIT_URL = REPO_URL + r"/commit/%s"
-if COMPARE_URL is None and REPO_URL is not None:
-    COMPARE_URL = REPO_URL + r"/compare/%s..%s"
-REPO_NAME = get_repo_name()
-REPO_DESC = get_repo_description()
-(REPO_OWNER_NAME, REPO_OWNER_EMAIL) = get_repo_owner()
+def _get_config_property(key: str, default: str | None = None, post=lambda x: x):
+    def f(self):
+        return post(self.get_config(key, default))
+
+    return property(f)
+
+
+class GitConfig:
+    get_config = staticmethod(get_config)
+
+    @property
+    def POST_URLS(self):
+        urls = self.get_config("hooks.webhookurl", "").strip().split()
+        # comma delimited format.  Tolerate dangling commas.
+        urls.extend(
+            x.strip()
+            for x in self.get_config("hooks.webhookurls", "").split(",")
+            if x.strip()
+        )
+        return tuple(urls)
+
+    POST_USER = _get_config_property("hooks.authuser")
+    POST_USER = _get_config_property("hooks.authuser")
+    POST_PASS = _get_config_property("hooks.authpass")
+    POST_REALM = _get_config_property("hooks.authrealm")
+    POST_PARALLELISM = _get_config_property("hooks.post-parallelism", "2", post=int)
+    POST_SECRET_TOKEN = _get_config_property("hooks.secrettoken")
+    POST_TIMEOUT = _get_config_property(
+        "hooks.timeout", post=lambda x: int(x) if x else 0
+    )
+    REPO_URL = _get_config_property("meta.url")
+    DEBUG = _get_config_property("hooks.webhook-debug", post=bool)
+
+    @property
+    def COMMIT_URL(self):
+        if (val := self.get_config("meta.commiturl")) is None and self.REPO_URL:
+            val = f"{self.REPO_URL}/%s"
+        return val
+
+    @property
+    def COMPARE_URL(self):
+        if (val := self.get_config("meta.compareurl")) is None and self.REPO_URL:
+            val = f"{self.REPO_URL}/compare/%s..%s"
+        return val
+
+    POST_CONTENTTYPE = _get_config_property(
+        "hooks.webhook-contenttype", "application/x-www-form-urlencoded"
+    )
+
+    # 2048 is github's current limit, so use that as a default.  0 disables the limit.
+    POST_MAX_COMMITS = _get_config_property("hooks.post-max-commits", "2048", post=int)
+    DEBUG = _get_config_property("hooks.webhook-debug", "false", post="true".__eq__)
+
+    @property
+    def REPO_NAME(self) -> str:
+        if get_config("core.bare", "false") == "true":
+            name = os.path.basename(os.getcwd())
+            if name.endswith(".git"):
+                name = name[:-4]
+            return name
+
+        # Fallback:
+        return os.path.basename(os.getcwd())
+
+    @property
+    def REPO_DESC(self) -> str:
+        if description := self.get_config("meta.description"):
+            return description
+
+        if description := self.get_config("gitweb.description"):
+            return description
+
+        if os.path.exists("description"):
+            with open("description", "r") as fp:
+                return fp.read().strip()
+
+        return ""
+
+    (REPO_OWNER_NAME, REPO_OWNER_EMAIL) = get_repo_owner()
+
+
+config = GitConfig()
+locals().update({k: getattr(config, k) for k in dir(GitConfig) if k.isupper()})
 
 
 def get_revisions(
