@@ -13,8 +13,7 @@ import typing
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import OrderedDict, defaultdict
-from datetime import datetime
+from collections import OrderedDict
 
 EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 ZEROS = "0000000000000000000000000000000000000000"
@@ -29,7 +28,6 @@ def git(args):
 
 
 def _git_config() -> OrderedDict[str, str]:
-
     # drop the trailing record termination.  -z returns {key}\n{value} and just {key} if no value.
     # Ignore things without set values, including empty values.
     items = (x.split("\n", 1) for x in git(["config", "-l", "-z"]).split("\0")[:-1])
@@ -495,6 +493,9 @@ def main(cli_args=sys.argv[1:], stdin=sys.stdin):
 
         i = iter(cli_args)
         targets = zip(map(f, i), map(f, i), i)
+    elif not post_urls and not DEBUG:
+        # nothing to notify and the hook isn't being tested on a server... bail.
+        return
     else:
         targets = (line.strip().split(" ", 2) for line in stdin)  # pyright: ignore[reportAssignmentType]
 
