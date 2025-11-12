@@ -140,7 +140,7 @@ POST_CONTENTTYPE = get_config(
     "hooks.webhook-contenttype", "application/x-www-form-urlencoded"
 )
 POST_TIMEOUT = get_config("hooks.timeout")
-DEBUG = get_config("hooks.webhook-debug")
+DEBUG = get_config("hooks.webhook-debug", "false") == "true"
 REPO_URL = get_config("meta.url")
 COMMIT_URL = get_config("meta.commiturl")
 COMPARE_URL = get_config("meta.compareurl")
@@ -476,9 +476,9 @@ def post(url, data):
 def main(cli_args=sys.argv[1:], stdin=sys.stdin):
     # disable posting for local invocations.
     post_urls = POST_URLS
-    debug = DEBUG
+    pretty_print = DEBUG
     if cli_args:
-        debug = True
+        pretty_print = True
         post_urls = []
         if len(cli_args) % 3:
             raise Exception("cli args must be in groups of 3; old new ref")
@@ -500,8 +500,8 @@ def main(cli_args=sys.argv[1:], stdin=sys.stdin):
         targets = (line.strip().split(" ", 2) for line in stdin)  # pyright: ignore[reportAssignmentType]
 
     for old, new, ref in targets:
-        json_data = make_json(old, new, ref, indent=2 if debug else None)
-        if debug:
+        json_data = make_json(old, new, ref, indent=2 if pretty_print else None)
+        if pretty_print:
             print(json_data)
 
         for url in post_urls:
